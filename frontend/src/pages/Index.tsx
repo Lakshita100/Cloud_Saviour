@@ -13,6 +13,9 @@ import {
   fetchAuditLog,
   fetchIncidentHistory,
   fetchLearningData,
+  fetchIncidentReport,
+  generateReportText,
+  downloadReportAsFile,
   getApiKey,
   setApiKey,
   clearApiKey,
@@ -49,6 +52,7 @@ const Index = () => {
   const [auditLog, setAuditLog] = useState<AuditEntry[]>([]);
   const [incidentHistory, setIncidentHistory] = useState<IncidentRecord[]>([]);
   const [learningData, setLearningData] = useState<LearningData | null>(null);
+  const [downloadingReport, setDownloadingReport] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -159,6 +163,42 @@ const Index = () => {
       const res = await fetchLearningData();
       setLearningData(res);
     } catch { setLearningData(null); }
+  };
+
+  const handleDownloadReport = async (incidentId: string) => {
+    setDownloadingReport(incidentId);
+    try {
+      const reportData = await fetchIncidentReport(incidentId);
+      const reportText = generateReportText(reportData);
+      const safeId = incidentId.replace(/[^a-zA-Z0-9-_]/g, "_");
+      downloadReportAsFile(reportText, `Incident_Report_${safeId}.txt`);
+    } catch (e: any) {
+      setError(e?.message || "Failed to download report");
+    } finally {
+      setDownloadingReport(null);
+    }
+  };
+
+  const handleDownloadAllReports = async () => {
+    if (incidentHistory.length === 0) return;
+    setDownloadingReport("all");
+    try {
+      const reports: string[] = [];
+      for (const inc of incidentHistory) {
+        try {
+          const reportData = await fetchIncidentReport(inc.id);
+          reports.push(generateReportText(reportData));
+        } catch {
+          reports.push(`\n[ERROR] Could not fetch report for incident ${inc.id}\n`);
+        }
+      }
+      const combined = reports.join("\n\n");
+      downloadReportAsFile(combined, `All_Incident_Reports_${new Date().toISOString().slice(0, 10)}.txt`);
+    } catch (e: any) {
+      setError(e?.message || "Failed to download reports");
+    } finally {
+      setDownloadingReport(null);
+    }
   };
 
   useEffect(() => {
@@ -318,9 +358,20 @@ const Index = () => {
           <div className="bg-card border border-border rounded-xl p-6">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-bold text-foreground">📋 Incident History</h2>
-              <button onClick={loadHistory} className="px-3 py-1 bg-accent rounded-md text-xs hover:bg-accent/80">
-                ↻ Refresh
-              </button>
+              <div className="flex items-center gap-2">
+                {incidentHistory.length > 0 && (
+                  <button
+                    onClick={handleDownloadAllReports}
+                    disabled={downloadingReport === "all"}
+                    className="px-3 py-1 bg-primary/10 border border-primary/30 text-primary rounded-md text-xs font-medium hover:bg-primary/20 disabled:opacity-50"
+                  >
+                    {downloadingReport === "all" ? "⏳ Generating..." : "📥 Download All Reports"}
+                  </button>
+                )}
+                <button onClick={loadHistory} className="px-3 py-1 bg-accent rounded-md text-xs hover:bg-accent/80">
+                  ↻ Refresh
+                </button>
+              </div>
             </div>
             {incidentHistory.length === 0 ? (
               <p className="text-muted-foreground text-sm">No incidents recorded yet. Run a pipeline to generate data.</p>
@@ -335,7 +386,8 @@ const Index = () => {
                       <th className="py-2 pr-4 font-medium">Status</th>
                       <th className="py-2 pr-4 font-medium">Risk</th>
                       <th className="py-2 pr-4 font-medium">Created</th>
-                      <th className="py-2 font-medium">Resolved</th>
+                      <th className="py-2 pr-4 font-medium">Resolved</th>
+                      <th className="py-2 font-medium">Report</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -358,7 +410,17 @@ const Index = () => {
                         </td>
                         <td className="py-2 pr-4 font-mono text-xs">{inc.risk_level || "—"}</td>
                         <td className="py-2 pr-4 text-xs text-muted-foreground">{inc.created_at}</td>
-                        <td className="py-2 text-xs text-muted-foreground">{inc.resolved_at || "—"}</td>
+                        <td className="py-2 pr-4 text-xs text-muted-foreground">{inc.resolved_at || "—"}</td>
+                        <td className="py-2">
+                          <button
+                            onClick={() => handleDownloadReport(inc.id)}
+                            disabled={downloadingReport === inc.id}
+                            className="px-2 py-1 bg-primary/10 border border-primary/30 text-primary rounded-md text-xs font-medium hover:bg-primary/20 disabled:opacity-50 whitespace-nowrap"
+                            title={`Download full report for ${inc.id}`}
+                          >
+                            {downloadingReport === inc.id ? "⏳" : "📄 Download"}
+                          </button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>

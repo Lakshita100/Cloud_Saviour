@@ -8,6 +8,7 @@ import asyncio
 import time
 import random
 import psutil
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Security
@@ -24,7 +25,7 @@ from prometheus_client import (
 # ── Persistent storage, security & learning ──
 from app.storage import (
     init_db, save_incident, update_incident, get_recent_incidents,
-    get_incident_stats, save_metrics_snapshot, get_metrics_history,
+    get_incident, get_incident_stats, save_metrics_snapshot, get_metrics_history,
     log_audit, get_audit_log, save_learning_record, cleanup_old_metrics,
 )
 from app.security import (
@@ -868,6 +869,18 @@ async def api_get_incidents(limit: int = 50):
     """Get recent incidents from persistent storage."""
     incidents = get_recent_incidents(limit=min(limit, 200))
     return {"incidents": incidents, "total": len(incidents)}
+
+
+@app.get("/api/incidents/{incident_id}/report")
+async def api_get_incident_report(incident_id: str):
+    """Get full incident report with all details for download."""
+    incident = get_incident(incident_id)
+    if not incident:
+        raise HTTPException(404, f"Incident {incident_id} not found")
+    return {
+        "incident": incident,
+        "report_generated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get("/api/incidents/stats")
