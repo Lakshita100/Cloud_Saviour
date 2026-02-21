@@ -1,4 +1,4 @@
-import type { SystemMetrics } from "@/lib/mock-data";
+import type { SystemMetrics } from "@/lib/api";
 import MetricCard from "./MetricCard";
 
 interface Props {

@@ -1,4 +1,4 @@
-import type { TimelineEvent } from "@/lib/mock-data";
+import type { TimelineEvent } from "@/lib/api";
 
 interface Props {
   events: TimelineEvent[];

@@ -1,4 +1,4 @@
-import type { Remediation } from "@/lib/mock-data";
+import type { Remediation } from "@/lib/api";
 
 interface Props {
   remediation: Remediation | null;

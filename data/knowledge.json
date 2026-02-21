@@ -1,0 +1,153 @@
+{
+  "incident_patterns": {
+    "MEMORY_LEAK": {
+      "description": "Memory usage continuously increasing without release, indicating objects are not being garbage collected.",
+      "common_causes": [
+        "Unreleased file handles or database connections",
+        "Growing in-memory caches without eviction",
+        "Circular references preventing garbage collection",
+        "Third-party library memory leak"
+      ],
+      "indicators": {
+        "memory_percent_threshold": 85.0,
+        "error_type": "memory_leak"
+      },
+      "severity_map": {
+        "low": {"memory_range": [70, 80]},
+        "medium": {"memory_range": [80, 90]},
+        "high": {"memory_range": [90, 95]},
+        "critical": {"memory_range": [95, 100]}
+      },
+      "remediation_steps": [
+        "Clear leaked memory allocations",
+        "Restart affected service pods",
+        "Scale horizontally to distribute load",
+        "Investigate and patch root cause in next release"
+      ],
+      "remediation_endpoint": "/remediate/memory_leak",
+      "expected_recovery_time_s": 10,
+      "risk_weight": 0.9
+    },
+    "DB_OVERLOAD": {
+      "description": "Database queries taking abnormally long, causing cascading latency in dependent services.",
+      "common_causes": [
+        "Missing or stale database indexes",
+        "Lock contention from long-running transactions",
+        "Connection pool exhaustion",
+        "Sudden traffic spike overwhelming read replicas"
+      ],
+      "indicators": {
+        "latency_threshold_s": 2.0,
+        "error_type": "db_overload"
+      },
+      "severity_map": {
+        "low": {"latency_range_s": [1.0, 2.0]},
+        "medium": {"latency_range_s": [2.0, 4.0]},
+        "high": {"latency_range_s": [4.0, 8.0]},
+        "critical": {"latency_range_s": [8.0, 999]}
+      },
+      "remediation_steps": [
+        "Kill long-running queries",
+        "Flush connection pool and recreate",
+        "Failover to read replicas",
+        "Scale database vertically or horizontally"
+      ],
+      "remediation_endpoint": "/remediate/db_overload",
+      "expected_recovery_time_s": 15,
+      "risk_weight": 0.85
+    },
+    "CRASH": {
+      "description": "Service process has terminated unexpectedly and is not responding to requests.",
+      "common_causes": [
+        "Unhandled exception in request handler",
+        "Out-of-memory kill by OS/container runtime",
+        "Segmentation fault in native dependency",
+        "Deadlock causing health check timeout"
+      ],
+      "indicators": {
+        "status": "crashed",
+        "error_type": "crash"
+      },
+      "severity_map": {
+        "critical": {"always": true}
+      },
+      "remediation_steps": [
+        "Restart the crashed service",
+        "Check for OOM events in container logs",
+        "Roll back to last known good deployment",
+        "Enable core dumps for post-mortem analysis"
+      ],
+      "remediation_endpoint": "/remediate/crash",
+      "expected_recovery_time_s": 5,
+      "risk_weight": 1.0
+    },
+    "CPU_SPIKE": {
+      "description": "CPU utilization has spiked beyond normal operating range, degrading responsiveness.",
+      "common_causes": [
+        "Infinite loop or tight polling in application code",
+        "Regex catastrophic backtracking",
+        "Crypto/compression operations on large payloads",
+        "Background job competing with request threads"
+      ],
+      "indicators": {
+        "cpu_percent_threshold": 80.0,
+        "error_type": "cpu_spike"
+      },
+      "severity_map": {
+        "low": {"cpu_range": [60, 75]},
+        "medium": {"cpu_range": [75, 85]},
+        "high": {"cpu_range": [85, 95]},
+        "critical": {"cpu_range": [95, 100]}
+      },
+      "remediation_steps": [
+        "Restart service to kill runaway threads",
+        "Scale out to distribute CPU load",
+        "Throttle or pause background jobs",
+        "Profile hot code paths and optimize"
+      ],
+      "remediation_endpoint": "/restart",
+      "expected_recovery_time_s": 8,
+      "risk_weight": 0.7
+    },
+    "LATENCY_SPIKE": {
+      "description": "Request latency has increased significantly, impacting user experience and SLA compliance.",
+      "common_causes": [
+        "Upstream service degradation",
+        "Network congestion or DNS resolution delays",
+        "Garbage collection pauses",
+        "Thread pool saturation"
+      ],
+      "indicators": {
+        "latency_threshold_s": 2.0,
+        "error_type": "latency_spike"
+      },
+      "severity_map": {
+        "low": {"latency_range_s": [1.0, 2.0]},
+        "medium": {"latency_range_s": [2.0, 4.0]},
+        "high": {"latency_range_s": [4.0, 8.0]},
+        "critical": {"latency_range_s": [8.0, 999]}
+      },
+      "remediation_steps": [
+        "Restart service to clear stuck connections",
+        "Check upstream dependency health",
+        "Increase connection/thread pool sizes",
+        "Enable circuit breakers"
+      ],
+      "remediation_endpoint": "/restart",
+      "expected_recovery_time_s": 10,
+      "risk_weight": 0.75
+    }
+  },
+  "escalation_rules": {
+    "max_auto_remediation_attempts": 3,
+    "escalation_after_failures": 2,
+    "notification_channels": ["webhook", "log"],
+    "cooldown_between_attempts_s": 30
+  },
+  "risk_thresholds": {
+    "low": [0.0, 0.3],
+    "medium": [0.3, 0.6],
+    "high": [0.6, 0.8],
+    "critical": [0.8, 1.0]
+  }
+}

@@ -1,44 +1,75 @@
 """
-Autonomous Cloud Incident System — Main Loop
+Autonomous Cloud Incident System — Main Loop (Full Pipeline)
 
-Continuously monitors the microservice, detects incidents,
-triggers AI-powered RCA, sends to n8n for remediation,
-and verifies recovery.
+Continuously monitors the microservice, detects incidents using both
+threshold and statistical anomaly detection, runs AI root cause analysis,
+calculates risk scores, orchestrates remediation via n8n + fallback,
+generates reports, and exposes state for the Streamlit dashboard.
 
-    Fetch Metrics → Detect → AI RCA → n8n Webhook → Verify Recovery
+Pipeline: Fetch Metrics -> Anomaly Detection -> Incident Detection ->
+          AI RCA -> Risk Scoring -> n8n Remediation -> Verify -> Report
 """
 
 import sys
 import os
 import time
-import requests
+import threading
 from datetime import datetime
 
 # Ensure project root is on the path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agent.cloud_connector import fetch_metrics
-from agent.detector import detect_incident, detect_incidents, check_health
+from agent.detector import detect_incidents, detect_incident
+from agent.anomaly_engine import (
+    detect_anomalies, ingest_metrics, get_stats,
+    get_anomaly_log, get_metric_history, get_metric_timestamps,
+)
 from agent.context_builder import build_context
 from agent.rca_engine import run_rca
-from agent.remediation_trigger import trigger_remediation, verify_service_health
+from agent.risk_engine import calculate_risk_score
+from agent.remediation_engine import orchestrate_remediation, get_remediation_log
+from agent.report_generator import (
+    generate_incident_report,
+    append_to_log,
+    save_report_json,
+    generate_summary,
+)
+from agent.knowledge_base import get_common_causes
+from agent.remediation_trigger import verify_service_health
 
 # ── Configuration ──
 POLL_INTERVAL = 10          # seconds between detection scans
-VERIFY_DELAY = 5            # seconds to wait before verifying remediation
-MAX_VERIFY_RETRIES = 6      # max retries for verification (6 × 5s = 30s)
 COOLDOWN = 30               # seconds to wait after a remediation cycle
 
-SERVICE_URL = "http://127.0.0.1:8000"
-
-# Map incident types → service remediation endpoints
-REMEDIATION_ENDPOINTS = {
-    "MEMORY_LEAK":   f"{SERVICE_URL}/remediate/memory_leak",
-    "DB_OVERLOAD":   f"{SERVICE_URL}/remediate/db_overload",
-    "CRASH":         f"{SERVICE_URL}/remediate/crash",
-    "CPU_SPIKE":     f"{SERVICE_URL}/restart",
-    "LATENCY_SPIKE": f"{SERVICE_URL}/restart",
+# ── Shared state for dashboard ──
+_dashboard_state = {
+    "status": "starting",
+    "last_poll": None,
+    "current_metrics": {},
+    "last_health": {},
+    "active_incidents": [],
+    "last_rca_results": {},
+    "last_risk_assessments": [],
+    "last_anomalies": [],
+    "incident_reports": [],
+    "summary": {},
+    "loop_count": 0,
+    "started_at": datetime.now().isoformat(),
 }
+_state_lock = threading.Lock()
+
+
+def get_dashboard_state() -> dict:
+    """Thread-safe read of current pipeline state for the dashboard."""
+    with _state_lock:
+        return dict(_dashboard_state)
+
+
+def _update_state(**kwargs):
+    """Thread-safe update of dashboard state."""
+    with _state_lock:
+        _dashboard_state.update(kwargs)
 
 
 def log(msg: str):
@@ -47,150 +78,149 @@ def log(msg: str):
     print(f"[{ts}] {msg}")
 
 
-def direct_remediate(incident_type: str) -> bool:
-    """
-    Fallback: call the service remediation endpoint directly
-    if n8n didn't resolve the incident.
-    """
-    url = REMEDIATION_ENDPOINTS.get(incident_type)
-    if not url:
-        log(f"[FALLBACK] No remediation endpoint for {incident_type}")
-        return False
-    try:
-        log(f"[FALLBACK] Calling {url} directly...")
-        resp = requests.post(url, timeout=10)
-        if resp.status_code == 200:
-            log(f"[FALLBACK] ✅ Direct remediation succeeded for {incident_type}")
-            return True
-        else:
-            log(f"[FALLBACK] ⚠️ Got {resp.status_code} from {url}")
-            return False
-    except Exception as e:
-        log(f"[FALLBACK] ❌ Error: {e}")
-        return False
-
-
-def run_verification_loop(incident_types: list[str] | None = None) -> bool:
-    """
-    Poll /health up to MAX_VERIFY_RETRIES times to confirm recovery.
-    If still degraded after 3 attempts, try direct fallback remediation.
-
-    Returns True if service recovered, False if still degraded.
-    """
-    for attempt in range(1, MAX_VERIFY_RETRIES + 1):
-        log(f"[VERIFY] Attempt {attempt}/{MAX_VERIFY_RETRIES} ...")
-        time.sleep(VERIFY_DELAY)
-
-        health = verify_service_health()
-        status = health.get("status", "unknown")
-        active = health.get("active_incidents", [])
-
-        if status == "healthy" and not active:
-            log("[VERIFY] ✅ Service fully recovered!")
-            return True
-
-        log(f"[VERIFY] Still {status} — active: {active}")
-
-        # After 3 failed attempts, try direct fallback remediation
-        if attempt == 3 and incident_types:
-            log("[VERIFY] ⚠️ n8n did not resolve — trying direct fallback...")
-            for inc_type in incident_types:
-                direct_remediate(inc_type)
-
-    log("[VERIFY] ❌ Service did NOT recover within timeout")
-    return False
-
-
-def verify_recovery() -> bool:
-    """
-    Phase 3 — Re-fetch metrics and check if error_count dropped.
-    Returns True if system recovered, False otherwise.
-    """
-    try:
-        metrics = fetch_metrics()
-        error_count = metrics.get("error_count", 0)
-        log(f"[VERIFY_RECOVERY] error_count = {error_count}")
-        return error_count < 1
-    except Exception as e:
-        log(f"[VERIFY_RECOVERY] ❌ Error fetching metrics: {e}")
-        return False
-
-
 def main_loop():
-    """Main autonomous detection → AI RCA → n8n remediation → verification loop."""
+    """
+    Full autonomous pipeline:
+      1. Fetch metrics
+      2. Statistical anomaly detection
+      3. Threshold + health-based incident detection
+      4. AI Root Cause Analysis (Ollama phi3)
+      5. Risk scoring
+      6. Remediation via n8n + fallback
+      7. Post-remediation verification
+      8. Report generation
+    """
     log("=" * 60)
-    log("  Autonomous Cloud Incident System — STARTED")
-    log(f"  Poll interval: {POLL_INTERVAL}s | Verify delay: {VERIFY_DELAY}s")
+    log("  Autonomous Cloud Incident System — FULL PIPELINE")
+    log(f"  Poll interval: {POLL_INTERVAL}s | Cooldown: {COOLDOWN}s")
     log("=" * 60)
 
-    # Quick health check at startup
-    health = check_health()
-    log(f"Initial health: {health.get('status', 'unknown')}")
+    _update_state(status="running")
 
     while True:
         try:
-            # ── PHASE 1: Fetch Metrics + Detection ──
-            # A) Health/endpoint-based detection (primary)
+            _update_state(
+                last_poll=datetime.now().isoformat(),
+                loop_count=_dashboard_state["loop_count"] + 1,
+            )
+
+            # ── PHASE 1: Fetch Metrics ──
+            log("Fetching metrics...")
+            metrics = fetch_metrics()
+            _update_state(current_metrics=metrics)
+            log(f"   CPU={metrics.get('cpu_percent', 0)}% | "
+                f"MEM={metrics.get('memory_percent', 0)}% | "
+                f"Errors={metrics.get('error_count', 0)}")
+
+            # ── PHASE 2: Anomaly Detection (Statistical) ──
+            anomalies = detect_anomalies(metrics)
+            _update_state(last_anomalies=anomalies)
+            if anomalies:
+                for a in anomalies:
+                    log(f"   Anomaly: {a['metric']} z={a['z_score']} ({a['direction']})")
+
+            # ── PHASE 3: Incident Detection ──
             incidents = detect_incidents()
 
-            # B) Also fetch Prometheus metrics for error-count trend detection
-            metrics = fetch_metrics()
-            simple_incident = detect_incident(metrics)
-            if simple_incident and not any(i["type"] == simple_incident["type"] for i in incidents):
-                incidents.append(simple_incident)
+            # Also use simple error-count trend detection
+            simple_inc = detect_incident(metrics)
+            if simple_inc and not any(i["type"] == simple_inc["type"] for i in incidents):
+                incidents.append(simple_inc)
+
+            # Check health for dashboard
+            health = verify_service_health()
+            _update_state(last_health=health, active_incidents=incidents)
 
             if not incidents:
-                log("✅ No incidents — system healthy")
+                log("No incidents — system healthy")
+                _update_state(status="healthy")
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # ── PHASE 2: AI RCA + n8n Remediation ──
+            _update_state(status="incident_detected")
+
+            # ── PHASE 4: AI RCA + Risk Scoring for each incident ──
+            rca_results = {}
+            risk_assessments = []
+            reports = []
+
             for incident in incidents:
                 inc_type = incident["type"]
                 details = incident.get("details", {})
-
-                log(f"🚨 INCIDENT DETECTED: {inc_type}")
+                log(f"INCIDENT: {inc_type}")
                 log(f"   Details: {details}")
+                log(f"   Known causes: {get_common_causes(inc_type)[:2]}")
 
-                # Run AI Root Cause Analysis (Ollama / phi3)
+                # AI Root Cause Analysis
+                rca = None
                 try:
                     prompt = build_context(metrics, incident)
                     rca = run_rca(prompt)
-                    log(f"   🤖 AI RCA: {rca.get('root_cause', 'UNKNOWN')} "
-                        f"(confidence: {rca.get('confidence', 0)})")
-                    log(f"   🔧 Recommended: {rca.get('recommended_action', 'N/A')}")
+                    rca_results[inc_type] = rca
+                    log(f"   AI RCA: {rca.get('root_cause', 'UNKNOWN')} "
+                        f"(confidence={rca.get('confidence', 0)})")
+                    log(f"   Recommended: {rca.get('recommended_action', 'N/A')}")
                 except Exception as e:
-                    log(f"   ⚠️ AI RCA failed: {e}")
-                    rca = None
+                    log(f"   AI RCA failed: {e}")
 
-                # Send to n8n production webhook
-                result = trigger_remediation(inc_type, details)
-                log(f"   n8n response: {result.get('status', 'unknown')}")
+                # Risk scoring
+                risk = calculate_risk_score(inc_type, metrics, rca, anomalies)
+                risk_assessments.append(risk)
+                log(f"   Risk: {risk['risk_score']} ({risk['risk_level']})")
 
-            # ── PHASE 3: Verification ──
-            log(f"⏳ Waiting {VERIFY_DELAY}s before verification...")
-            inc_types = [i["type"] for i in incidents]
-            recovered = run_verification_loop(inc_types)
+                # ── PHASE 5: Remediation ──
+                _update_state(status="remediating")
+                log(f"   Orchestrating remediation for {inc_type}...")
+                rem_result = orchestrate_remediation(
+                    inc_type, details, risk["risk_score"]
+                )
+                log(f"   Remediation: {rem_result['status']} "
+                    f"(attempt #{rem_result['attempt']}, {rem_result['elapsed_s']}s)")
 
-            # Also verify via error_count (Prometheus)
-            if recovered:
-                metrics_ok = verify_recovery()
-                if metrics_ok:
-                    log("🎉 REMEDIATION CYCLE COMPLETE — service restored, metrics normalized")
-                else:
-                    log("🎉 REMEDIATION CYCLE COMPLETE — service healthy but error_count still elevated")
+                # ── PHASE 6: Report Generation ──
+                report = generate_incident_report(
+                    incident=incident,
+                    metrics=metrics,
+                    rca_result=rca,
+                    risk_assessment=risk,
+                    remediation_result=rem_result,
+                    anomalies=anomalies,
+                )
+                reports.append(report)
+                append_to_log(report)
+                save_report_json(report)
+                log(f"   Report: {report['report_id']} ({report['status']})")
+
+            # Update dashboard state with all results
+            _update_state(
+                last_rca_results=rca_results,
+                last_risk_assessments=risk_assessments,
+                incident_reports=_dashboard_state["incident_reports"] + reports,
+                summary=generate_summary(
+                    _dashboard_state["incident_reports"] + reports
+                ),
+            )
+
+            # Final verification
+            final_health = verify_service_health()
+            if final_health.get("status") == "healthy":
+                log("REMEDIATION COMPLETE — service restored")
+                _update_state(status="recovered")
             else:
-                log("⚠️ REMEDIATION CYCLE INCOMPLETE — manual review needed")
+                log("Service still degraded — check dashboard for details")
+                _update_state(status="degraded")
 
-            # ── Cooldown before next scan ──
-            log(f"⏳ Cooldown {COOLDOWN}s before next scan...")
+            # Cooldown
+            log(f"Cooldown {COOLDOWN}s...")
             time.sleep(COOLDOWN)
 
         except KeyboardInterrupt:
-            log("🛑 Shutting down (Ctrl+C)")
+            log("Shutting down (Ctrl+C)")
+            _update_state(status="stopped")
             break
         except Exception as e:
-            log(f"❌ Unexpected error in main loop: {e}")
+            log(f"Error in main loop: {e}")
+            _update_state(status="error")
             time.sleep(POLL_INTERVAL)
 
 

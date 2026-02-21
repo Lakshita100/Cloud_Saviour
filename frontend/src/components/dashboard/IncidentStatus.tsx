@@ -1,4 +1,4 @@
-import type { Incident } from "@/lib/mock-data";
+import type { Incident } from "@/lib/api";
 
 interface Props {
   incident: Incident | null;

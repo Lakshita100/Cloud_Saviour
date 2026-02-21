@@ -1,4 +1,4 @@
-import type { RCAOutput as RCAData } from "@/lib/mock-data";
+import type { RCAOutput as RCAData } from "@/lib/api";
 
 interface Props {
   rca: RCAData | null;
