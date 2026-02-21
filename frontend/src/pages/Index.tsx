@@ -67,15 +67,24 @@ const Index = () => {
   const handleTrigger = async (
     type: "memory_leak" | "db_overload" | "crash" | "cpu_spike" | "latency_spike"
   ) => {
-    setLoading(true);
+    setPipelineRunning(true);
+    setError(null);
     try {
       await triggerIncident(type);
-      await refresh();
+      await refresh();                 // show incident immediately
+      await runPipeline();             // auto-run AI analysis
+      await refresh();                 // show RCA + remediation results
     } catch {
-      // crash endpoint throws — refresh anyway
-      await refresh();
+      // crash endpoint may throw — still try pipeline
+      try {
+        await refresh();
+        await runPipeline();
+        await refresh();
+      } catch {
+        setError("Pipeline failed after incident injection — check backend logs");
+      }
     } finally {
-      setLoading(false);
+      setPipelineRunning(false);
     }
   };
 
@@ -127,7 +136,7 @@ const Index = () => {
             <button
               key={type}
               onClick={() => handleTrigger(type)}
-              disabled={loading}
+              disabled={pipelineRunning || loading}
               className="px-3 py-1.5 bg-card border border-border rounded-md text-xs font-mono hover:bg-accent disabled:opacity-50"
             >
               {label}

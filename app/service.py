@@ -329,32 +329,79 @@ def _add_event(message: str):
         _timeline_events.pop()
 
 
+def _estimate_histogram_percentile(histogram: Histogram, percentile: float) -> float:
+    """
+    Estimate a percentile (e.g. 0.95) from a Prometheus Histogram in ms.
+    Uses linear interpolation between bucket boundaries.
+    """
+    buckets = []  # list of (upper_bound, cumulative_count)
+    total = 0.0
+
+    for metric in histogram.collect():
+        for sample in metric.samples:
+            if sample.name.endswith("_bucket"):
+                le = sample.labels.get("le", "")
+                if le == "+Inf":
+                    total = sample.value
+                else:
+                    buckets.append((float(le), sample.value))
+
+    if total == 0:
+        return 0.0
+
+    buckets.sort(key=lambda x: x[0])
+    target = percentile * total
+    prev_bound, prev_count = 0.0, 0.0
+
+    for upper, count in buckets:
+        if count >= target:
+            # Linear interpolation within this bucket
+            fraction = (target - prev_count) / max(count - prev_count, 1)
+            latency_s = prev_bound + fraction * (upper - prev_bound)
+            return latency_s * 1000  # convert to ms
+        prev_bound, prev_count = upper, count
+
+    # Above all buckets — return last bucket boundary
+    return buckets[-1][0] * 1000 if buckets else 0.0
+
+
+def _count_db_connections() -> int:
+    """
+    Count real network connections from this process.
+    Counts ESTABLISHED TCP connections as a proxy for DB / service connections.
+    """
+    try:
+        proc = psutil.Process()
+        connections = proc.net_connections(kind="tcp")
+        established = [c for c in connections if c.status == "ESTABLISHED"]
+        return len(established)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return 0
+
+
 @app.get("/api/dashboard")
 async def api_dashboard():
     """
     Single endpoint that returns all data the React frontend needs.
     Matches the DashboardData interface exactly.
     """
-    # Get current metrics
+    # ── Real CPU & Memory from psutil ──
     cpu = psutil.cpu_percent(interval=None)
     mem = psutil.virtual_memory().percent
 
-    # Parse error count from Prometheus metrics
-    prom_text = generate_latest().decode("utf-8")
+    # ── Real error count from Prometheus counter ──
     error_count = 0.0
-    for line in prom_text.splitlines():
-        if line.startswith("service_errors_total"):
-            match = _re.search(r'\}\s+([\d.]+)', line)
-            if match:
-                error_count += float(match.group(1))
+    for metric in ERROR_COUNTER.collect():
+        for sample in metric.samples:
+            if sample.name.endswith("_total"):
+                error_count += sample.value
 
-    # Parse latency p95 (approximate from histogram)
-    latency_p95 = 0.0
-    for line in prom_text.splitlines():
-        if 'service_request_latency_seconds_bucket{le="1.0"}' in line:
-            match = _re.search(r'\s+([\d.]+)$', line)
-            if match:
-                latency_p95 = float(match.group(1))
+    # ── Real latency P95 from Prometheus histogram ──
+    # Estimate p95 from histogram buckets using linear interpolation
+    latency_p95_ms = _estimate_histogram_percentile(REQUEST_LATENCY, 0.95)
+
+    # ── Real DB connections: count open TCP connections to common DB ports ──
+    db_connections = _count_db_connections()
 
     # Health status
     if _service_state["crashed"]:
@@ -387,9 +434,9 @@ async def api_dashboard():
         "metrics": {
             "cpu": round(cpu, 1),
             "memory": round(mem, 1),
-            "dbConnections": 24 if not _service_state["db_overload_active"] else 89,
+            "dbConnections": db_connections,
             "errorRate": round(error_count, 2),
-            "latencyP95": round(latency_p95 * 1000, 0),  # convert to ms
+            "latencyP95": round(latency_p95_ms, 1),
             "deploymentVersion": "v1.0.0",
         },
         "incident": incident,
