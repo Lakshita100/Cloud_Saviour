@@ -1,0 +1,33 @@
+# Git & OS
+.git
+.gitignore
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Frontend (not needed in backend container)
+frontend/
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+docker-compose.yml
+Dockerfile
+
+# Docs
+README.md
+*.md
+
+# Data (SQLite DB is created at runtime)
+data/cloudsaviour.db
+
+# Prometheus volume
+prometheus_data/

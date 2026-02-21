@@ -2,10 +2,12 @@
  * API client — fetches real data from the FastAPI backend.
  *
  * Backend runs on :8000, Vite dev server proxies /api → :8000.
+ * In production, set VITE_API_URL to the backend's public URL.
  * All requests include the X-API-Key header for authentication.
  */
 
-const API_BASE = "/api";
+const BACKEND_URL = import.meta.env.VITE_API_URL || "";
+const API_BASE = `${BACKEND_URL}/api`;
 
 // ── API Key Management ──
 // Stored in localStorage so it persists across refreshes
@@ -101,14 +103,14 @@ export async function runPipeline(): Promise<{
 export async function triggerIncident(
   type: "memory_leak" | "db_overload" | "crash" | "cpu_spike" | "latency_spike"
 ): Promise<Record<string, unknown>> {
-  const res = await fetch(`/trigger/${type}`, { method: "POST", headers: authHeaders() });
+  const res = await fetch(`${BACKEND_URL}/trigger/${type}`, { method: "POST", headers: authHeaders() });
   if (res.status === 401 || res.status === 403) throw new Error("AUTH_REQUIRED");
   if (!res.ok) throw new Error(`Trigger error: ${res.status}`);
   return res.json();
 }
 
 export async function restartService(): Promise<Record<string, unknown>> {
-  const res = await fetch("/restart", { method: "POST", headers: authHeaders() });
+  const res = await fetch(`${BACKEND_URL}/restart`, { method: "POST", headers: authHeaders() });
   if (res.status === 401 || res.status === 403) throw new Error("AUTH_REQUIRED");
   if (!res.ok) throw new Error(`Restart error: ${res.status}`);
   return res.json();

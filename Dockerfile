@@ -6,9 +6,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy all application code
 COPY app/ ./app/
+COPY agent/ ./agent/
+COPY data/ ./data/
+COPY dashboard/ ./dashboard/
+COPY monitoring/ ./monitoring/
 
-EXPOSE 8000
+# Railway uses PORT env variable
+ENV PORT=8000
+EXPOSE ${PORT}
 
-CMD ["uvicorn", "app.service:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD uvicorn app.service:app --host 0.0.0.0 --port ${PORT}
