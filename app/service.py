@@ -42,6 +42,18 @@ REQUEST_LATENCY = Histogram(
 )
 
 # ──────────────────────────────────────────────
+# Service state (used by /health and remediation)
+# ──────────────────────────────────────────────
+_service_state = {
+    "crashed": False,
+    "degraded": False,
+    "memory_leak_active": False,
+    "db_overload_active": False,
+    "latency_spike_active": False,
+    "cpu_spike_active": False,
+}
+
+# ──────────────────────────────────────────────
 # Background task: refresh system metrics every 5 s
 # ──────────────────────────────────────────────
 async def _refresh_system_metrics():
@@ -90,10 +102,24 @@ async def root():
 
 @app.get("/health")
 async def health():
+    if _service_state["crashed"]:
+        status = "crashed"
+    elif _service_state["degraded"] or any(
+        _service_state[k] for k in (
+            "memory_leak_active", "db_overload_active",
+            "latency_spike_active", "cpu_spike_active",
+        )
+    ):
+        status = "degraded"
+    else:
+        status = "healthy"
     return {
-        "status": "healthy",
+        "status": status,
         "cpu_percent": psutil.cpu_percent(interval=None),
         "memory_percent": psutil.virtual_memory().percent,
+        "active_incidents": [
+            k for k, v in _service_state.items() if v and k not in ("degraded",)
+        ],
     }
 
 
@@ -117,6 +143,7 @@ async def trigger_memory_leak():
     """Allocate ~50 MB per call to simulate a memory leak."""
     chunk = bytearray(50 * 1024 * 1024)  # 50 MB
     _leak_store.append(bytes(chunk))
+    _service_state["memory_leak_active"] = True
     ERROR_COUNTER.labels(error_type="memory_leak").inc()
     return {
         "incident": "memory_leak",
@@ -128,6 +155,7 @@ async def trigger_memory_leak():
 @app.post("/trigger/db_overload")
 async def trigger_db_overload():
     """Simulate a slow / overloaded database call."""
+    _service_state["db_overload_active"] = True
     delay = random.uniform(2.0, 5.0)
     await asyncio.sleep(delay)
     ERROR_COUNTER.labels(error_type="db_overload").inc()
@@ -140,7 +168,8 @@ async def trigger_db_overload():
 
 @app.post("/trigger/crash")
 async def trigger_crash():
-    """Increment the error counter and raise an unhandled exception."""
+    """Mark service as crashed and raise an unhandled exception."""
+    _service_state["crashed"] = True
     ERROR_COUNTER.labels(error_type="crash").inc()
     raise RuntimeError("Simulated service crash triggered via /trigger/crash")
 
@@ -149,10 +178,12 @@ async def trigger_crash():
 async def trigger_cpu_spike():
     """Burn CPU for ~4 seconds to simulate a CPU spike."""
     import math
+    _service_state["cpu_spike_active"] = True
     ERROR_COUNTER.labels(error_type="cpu_spike").inc()
     end = time.time() + 4
     while time.time() < end:
         math.factorial(5000)
+    _service_state["cpu_spike_active"] = False
     return {
         "incident": "cpu_spike",
         "duration_s": 4,
@@ -163,13 +194,78 @@ async def trigger_cpu_spike():
 @app.post("/trigger/latency_spike")
 async def trigger_latency_spike():
     """Inject a random 3–8 s delay to simulate network / upstream latency."""
+    _service_state["latency_spike_active"] = True
     delay = random.uniform(3.0, 8.0)
     await asyncio.sleep(delay)
     ERROR_COUNTER.labels(error_type="latency_spike").inc()
+    _service_state["latency_spike_active"] = False
     return {
         "incident": "latency_spike",
         "simulated_delay_s": round(delay, 2),
         "message": "Simulated latency spike",
+    }
+
+
+# ──────────────────────────────────────────────
+# Remediation Endpoints (called by n8n / agent)
+# ──────────────────────────────────────────────
+@app.post("/remediate/memory_leak")
+async def remediate_memory_leak():
+    """Free all leaked memory and reset state."""
+    freed_mb = len(_leak_store) * 50
+    _leak_store.clear()
+    _service_state["memory_leak_active"] = False
+    return {
+        "remediation": "memory_leak",
+        "freed_mb": freed_mb,
+        "message": f"Cleared {freed_mb} MB of leaked memory",
+    }
+
+
+@app.post("/remediate/db_overload")
+async def remediate_db_overload():
+    """Reset the database overload state."""
+    _service_state["db_overload_active"] = False
+    return {
+        "remediation": "db_overload",
+        "message": "Database overload state cleared",
+    }
+
+
+@app.post("/remediate/crash")
+async def remediate_crash():
+    """Reset crash flag so /health returns healthy again."""
+    _service_state["crashed"] = False
+    return {
+        "remediation": "crash",
+        "message": "Crash state cleared, service marked healthy",
+    }
+
+
+@app.post("/restart")
+async def restart_service():
+    """Full reset — clear all incident state and leaked memory."""
+    _leak_store.clear()
+    for key in _service_state:
+        _service_state[key] = False
+    return {
+        "remediation": "full_restart",
+        "message": "All incident states cleared, service fully restored",
+        "state": dict(_service_state),
+    }
+
+
+# ──────────────────────────────────────────────
+# Verification State Endpoint
+# ──────────────────────────────────────────────
+@app.get("/state")
+async def get_state():
+    """Return the full internal service state for verification."""
+    return {
+        "service_state": dict(_service_state),
+        "leaked_memory_mb": len(_leak_store) * 50,
+        "cpu_percent": psutil.cpu_percent(interval=None),
+        "memory_percent": psutil.virtual_memory().percent,
     }
 
 
