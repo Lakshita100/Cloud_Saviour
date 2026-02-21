@@ -1,15 +1,35 @@
-def build_context(metrics, incident):
+"""
+Context Builder — Builds an AI prompt from metrics and incident data.
+"""
+
+
+def build_context(metrics: dict, incident: dict) -> str:
+    """
+    Build a structured prompt for the RCA engine.
+
+    Works with both simple incidents (severity field) and
+    rich incidents (details dict) from detect_incidents().
+    """
+    severity = incident.get("severity", "UNKNOWN")
+    details = incident.get("details", {})
+    error_count = metrics.get("error_count", 0)
+    cpu = metrics.get("cpu_percent", "N/A")
+    mem = metrics.get("memory_percent", "N/A")
+
     return f"""
 You are a Cloud Site Reliability Engineer AI.
 
 An incident has been detected in the system.
 
 System Metrics:
-- Error Count: {metrics['error_count']}
+- Error Count: {error_count}
+- CPU Usage: {cpu}%
+- Memory Usage: {mem}%
 
 Incident Details:
 - Type: {incident['type']}
-- Severity: {incident['severity']}
+- Severity: {severity}
+- Details: {details}
 
 Your task:
 1. Identify the most probable root cause.

@@ -1,29 +1,11 @@
-<<<<<<< Updated upstream
-from fastapi import FastAPI
-from prometheus_client import Counter, generate_latest
-from fastapi.responses import Response
-
-app = FastAPI()
-
-# Define metric
-error_counter = Counter("app_errors_total", "Total number of application errors")
-
-@app.get("/trigger/memory")
-def trigger_memory():
-    error_counter.inc()
-    return {"message": "Error triggered"}
-
-@app.get("/metrics")
-def metrics():
-    return Response(generate_latest(), media_type="text/plain")
-=======
 """
 Autonomous Cloud Incident System — Main Loop
 
 Continuously monitors the microservice, detects incidents,
-triggers n8n remediation, and verifies recovery.
+triggers AI-powered RCA, sends to n8n for remediation,
+and verifies recovery.
 
-    Detection → n8n Webhook → Remediation → Verification
+    Fetch Metrics → Detect → AI RCA → n8n Webhook → Verify Recovery
 """
 
 import sys
@@ -35,7 +17,10 @@ from datetime import datetime
 # Ensure project root is on the path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agent.detector import detect_incidents, check_health
+from agent.cloud_connector import fetch_metrics
+from agent.detector import detect_incident, detect_incidents, check_health
+from agent.context_builder import build_context
+from agent.rca_engine import run_rca
 from agent.remediation_trigger import trigger_remediation, verify_service_health
 
 # ── Configuration ──
@@ -116,8 +101,23 @@ def run_verification_loop(incident_types: list[str] | None = None) -> bool:
     return False
 
 
+def verify_recovery() -> bool:
+    """
+    Phase 3 — Re-fetch metrics and check if error_count dropped.
+    Returns True if system recovered, False otherwise.
+    """
+    try:
+        metrics = fetch_metrics()
+        error_count = metrics.get("error_count", 0)
+        log(f"[VERIFY_RECOVERY] error_count = {error_count}")
+        return error_count < 1
+    except Exception as e:
+        log(f"[VERIFY_RECOVERY] ❌ Error fetching metrics: {e}")
+        return False
+
+
 def main_loop():
-    """Main autonomous detection → remediation → verification loop."""
+    """Main autonomous detection → AI RCA → n8n remediation → verification loop."""
     log("=" * 60)
     log("  Autonomous Cloud Incident System — STARTED")
     log(f"  Poll interval: {POLL_INTERVAL}s | Verify delay: {VERIFY_DELAY}s")
@@ -129,21 +129,39 @@ def main_loop():
 
     while True:
         try:
-            # ── PHASE 1: Detection ──
+            # ── PHASE 1: Fetch Metrics + Detection ──
+            # A) Health/endpoint-based detection (primary)
             incidents = detect_incidents()
+
+            # B) Also fetch Prometheus metrics for error-count trend detection
+            metrics = fetch_metrics()
+            simple_incident = detect_incident(metrics)
+            if simple_incident and not any(i["type"] == simple_incident["type"] for i in incidents):
+                incidents.append(simple_incident)
 
             if not incidents:
                 log("✅ No incidents — system healthy")
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # ── PHASE 2: Trigger remediation via n8n ──
+            # ── PHASE 2: AI RCA + n8n Remediation ──
             for incident in incidents:
                 inc_type = incident["type"]
-                details = incident["details"]
+                details = incident.get("details", {})
 
                 log(f"🚨 INCIDENT DETECTED: {inc_type}")
                 log(f"   Details: {details}")
+
+                # Run AI Root Cause Analysis (Ollama / phi3)
+                try:
+                    prompt = build_context(metrics, incident)
+                    rca = run_rca(prompt)
+                    log(f"   🤖 AI RCA: {rca.get('root_cause', 'UNKNOWN')} "
+                        f"(confidence: {rca.get('confidence', 0)})")
+                    log(f"   🔧 Recommended: {rca.get('recommended_action', 'N/A')}")
+                except Exception as e:
+                    log(f"   ⚠️ AI RCA failed: {e}")
+                    rca = None
 
                 # Send to n8n production webhook
                 result = trigger_remediation(inc_type, details)
@@ -154,8 +172,13 @@ def main_loop():
             inc_types = [i["type"] for i in incidents]
             recovered = run_verification_loop(inc_types)
 
+            # Also verify via error_count (Prometheus)
             if recovered:
-                log("🎉 REMEDIATION CYCLE COMPLETE — service restored")
+                metrics_ok = verify_recovery()
+                if metrics_ok:
+                    log("🎉 REMEDIATION CYCLE COMPLETE — service restored, metrics normalized")
+                else:
+                    log("🎉 REMEDIATION CYCLE COMPLETE — service healthy but error_count still elevated")
             else:
                 log("⚠️ REMEDIATION CYCLE INCOMPLETE — manual review needed")
 
@@ -173,4 +196,3 @@ def main_loop():
 
 if __name__ == "__main__":
     main_loop()
->>>>>>> Stashed changes
