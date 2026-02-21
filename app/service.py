@@ -10,14 +10,32 @@ import random
 import psutil
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, Depends, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from prometheus_client import (
     Counter,
     Gauge,
     Histogram,
     generate_latest,
     CONTENT_TYPE_LATEST,
+)
+
+# ── Persistent storage, security & learning ──
+from app.storage import (
+    init_db, save_incident, update_incident, get_recent_incidents,
+    get_incident_stats, save_metrics_snapshot, get_metrics_history,
+    log_audit, get_audit_log, save_learning_record, cleanup_old_metrics,
+)
+from app.security import (
+    authenticate, require_permission, create_api_key,
+    revoke_api_key, list_api_keys, get_default_admin_key,
+    validate_api_key, api_key_header, PUBLIC_ENDPOINTS,
+)
+from app.learning import (
+    record_resolved_incident, enrich_prompt_with_history,
+    get_confidence_calibration, auto_update_knowledge_base,
+    get_learning_dashboard_data,
 )
 
 # ──────────────────────────────────────────────
@@ -58,17 +76,47 @@ _service_state = {
 # Background task: refresh system metrics every 5 s
 # ──────────────────────────────────────────────
 async def _refresh_system_metrics():
+    """Refresh Prometheus gauges and persist metrics snapshots every 5s."""
     while True:
-        CPU_USAGE.set(psutil.cpu_percent(interval=None))
-        MEMORY_USAGE.set(psutil.virtual_memory().percent)
+        cpu = psutil.cpu_percent(interval=None)
+        mem = psutil.virtual_memory().percent
+        CPU_USAGE.set(cpu)
+        MEMORY_USAGE.set(mem)
+        # Persist to SQLite every cycle
+        try:
+            save_metrics_snapshot(
+                cpu=cpu, memory=mem,
+                error_count=sum(
+                    s.value for m in ERROR_COUNTER.collect()
+                    for s in m.samples if s.name.endswith("_total")
+                ),
+                latency_p95=_estimate_histogram_percentile(REQUEST_LATENCY, 0.95) if 'REQUEST_LATENCY' in dir() else 0,
+                db_connections=_count_db_connections(),
+            )
+        except Exception:
+            pass  # don't crash the metric loop
         await asyncio.sleep(5)
+
+
+async def _periodic_cleanup():
+    """Clean up old metrics data every hour."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            cleanup_old_metrics(days=7)
+        except Exception:
+            pass
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_refresh_system_metrics())
+    # Initialize persistent storage
+    init_db()
+    metrics_task = asyncio.create_task(_refresh_system_metrics())
+    cleanup_task = asyncio.create_task(_periodic_cleanup())
     yield
-    task.cancel()
+    metrics_task.cancel()
+    cleanup_task.cancel()
 
 
 # ──────────────────────────────────────────────
@@ -94,14 +142,58 @@ app.add_middleware(
 
 
 # ──────────────────────────────────────────────
-# Middleware — track latency for every request
+# Middleware — authentication + audit + latency
 # ──────────────────────────────────────────────
 @app.middleware("http")
-async def track_latency(request: Request, call_next):
+async def security_and_latency_middleware(request: Request, call_next):
     start = time.perf_counter()
+    path = request.url.path
+
+    # ── Authentication ──
+    # Skip auth for public endpoints and CORS preflight
+    is_public = path in PUBLIC_ENDPOINTS or request.method == "OPTIONS"
+    key_name = "public"
+    key_role = "viewer"
+
+    if not is_public:
+        raw_key = request.headers.get("X-API-Key", "")
+        if not raw_key:
+            return Response(
+                content='{"detail": "Missing API key. Include X-API-Key header."}',
+                status_code=401,
+                media_type="application/json",
+            )
+        key_data = validate_api_key(raw_key)
+        if not key_data:
+            return Response(
+                content='{"detail": "Invalid or revoked API key."}',
+                status_code=403,
+                media_type="application/json",
+            )
+        key_name = key_data["name"]
+        key_role = key_data["role"]
+        request.state.api_key_name = key_name
+        request.state.api_key_role = key_role
+
     response = await call_next(request)
     elapsed = time.perf_counter() - start
     REQUEST_LATENCY.observe(elapsed)
+
+    # ── Audit log (non-GET requests and important GETs) ──
+    if request.method != "GET" or path.startswith("/api/"):
+        try:
+            client_ip = request.client.host if request.client else "unknown"
+            log_audit(
+                action=f"{request.method} {path}",
+                endpoint=path,
+                method=request.method,
+                api_key_name=key_name,
+                source_ip=client_ip,
+                details={"status_code": response.status_code, "elapsed_s": round(elapsed, 3)},
+            )
+        except Exception:
+            pass  # never fail a request due to audit
+
     return response
 
 
@@ -534,11 +626,16 @@ async def api_run_pipeline():
     rca_raw: dict = {}
     try:
         prompt = build_context(metrics, inc)
+        # Enrich prompt with historical patterns from learning loop
+        prompt = enrich_prompt_with_history(inc_type, prompt)
         rca_raw = await asyncio.to_thread(run_rca, prompt)  # blocking → thread
         model_used = rca_raw.get("_model_used", "ollama")
         confidence_raw = rca_raw.get("confidence", 0)
         # Normalise: if model returned 0-1, multiply by 100; if already %, keep
         confidence_pct = round(confidence_raw * 100) if confidence_raw <= 1 else round(confidence_raw)
+        # Apply confidence calibration from learning loop
+        calibration = get_confidence_calibration(inc_type)
+        confidence_pct = min(100, round(confidence_pct * calibration))
         _last_rca = {
             "rootCause": rca_raw.get("root_cause", "Unknown"),
             "confidence": max(confidence_pct, 1),  # never show 0% if AI responded
@@ -620,7 +717,41 @@ async def api_run_pipeline():
     _last_incident["status"] = "Remediated" if remediated else "RCA Complete"
     _add_event(f"Remediation {'succeeded' if remediated else 'failed'} ({elapsed}s)")
 
-    # ── Phase 5: Verification (direct state check) ──
+    # ── Phase 5: Persist to DB & Learning Loop ──
+    # Save incident to persistent storage
+    db_inc_id = save_incident({
+        "id": _last_incident["id"],
+        "type": inc_type,
+        "severity": _last_incident.get("severity", "HIGH"),
+        "status": _last_incident["status"],
+        "details": details,
+        "metrics_snapshot": metrics,
+    })
+    # Update with RCA and remediation results
+    update_incident(db_inc_id,
+        rca_result=rca_raw or {},
+        risk_score=risk.get("risk_score", 0),
+        risk_level=risk.get("risk_level", "unknown"),
+        remediation_result=_last_remediation,
+        resolved_at=datetime.now().isoformat() if remediated else None,
+        status="remediated" if remediated else "rca_complete",
+    )
+
+    # Record in learning loop for future improvement
+    if rca_raw:
+        record_resolved_incident(
+            incident_type=inc_type,
+            rca_result=rca_raw,
+            remediation_success=remediated,
+            metrics_context=metrics,
+        )
+        # Auto-update knowledge base if enough data
+        try:
+            auto_update_knowledge_base(inc_type)
+        except Exception:
+            pass
+
+    # ── Phase 6: Verification (direct state check) ──
     active_after = [k for k, v in state.items() if v and k not in ("degraded",)]
     if not active_after:
         _add_event("System recovered — all metrics nominal")
@@ -653,6 +784,125 @@ async def api_health_check() -> dict:
         "status": status,
         "active_incidents": [k for k, v in _service_state.items() if v and k != "degraded"],
     }
+
+
+# ──────────────────────────────────────────────
+# Security Management Endpoints
+# ──────────────────────────────────────────────
+
+class CreateKeyRequest(BaseModel):
+    name: str
+    role: str = "viewer"
+
+class RevokeKeyRequest(BaseModel):
+    name: str
+
+class FeedbackRequest(BaseModel):
+    record_id: int
+    was_correct: bool
+    feedback: str = ""
+
+
+@app.post("/api/keys/create")
+async def api_create_key(req: CreateKeyRequest, request: Request):
+    """Create a new API key (admin only)."""
+    role = getattr(request.state, "api_key_role", "viewer")
+    if role != "admin":
+        raise HTTPException(403, "Only admins can create API keys")
+    try:
+        raw_key = create_api_key(req.name, req.role)
+        return {"key": raw_key, "name": req.name, "role": req.role}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/keys/revoke")
+async def api_revoke_key(req: RevokeKeyRequest, request: Request):
+    """Revoke an API key by name (admin only)."""
+    role = getattr(request.state, "api_key_role", "viewer")
+    if role != "admin":
+        raise HTTPException(403, "Only admins can revoke API keys")
+    success = revoke_api_key(req.name)
+    return {"revoked": success, "name": req.name}
+
+
+@app.get("/api/keys")
+async def api_list_keys(request: Request):
+    """List all API keys (admin only)."""
+    role = getattr(request.state, "api_key_role", "viewer")
+    if role != "admin":
+        raise HTTPException(403, "Only admins can view API keys")
+    return {"keys": list_api_keys()}
+
+
+@app.get("/api/keys/default")
+async def api_get_default_key(request: Request):
+    """Get the default admin key (admin only, for initial setup)."""
+    role = getattr(request.state, "api_key_role", "viewer")
+    if role != "admin":
+        raise HTTPException(403, "Admin only")
+    default = get_default_admin_key()
+    return {"default_admin_key": default}
+
+
+# ──────────────────────────────────────────────
+# Audit Log Endpoints
+# ──────────────────────────────────────────────
+
+@app.get("/api/audit")
+async def api_get_audit(limit: int = 100, request: Request = None):
+    """Get recent audit log entries."""
+    role = getattr(request.state, "api_key_role", "viewer") if request else "viewer"
+    if role not in ("admin", "operator"):
+        raise HTTPException(403, "Insufficient permissions to view audit log")
+    entries = get_audit_log(limit=min(limit, 500))
+    return {"audit_log": entries, "total": len(entries)}
+
+
+# ──────────────────────────────────────────────
+# Incident History Endpoints
+# ──────────────────────────────────────────────
+
+@app.get("/api/incidents")
+async def api_get_incidents(limit: int = 50):
+    """Get recent incidents from persistent storage."""
+    incidents = get_recent_incidents(limit=min(limit, 200))
+    return {"incidents": incidents, "total": len(incidents)}
+
+
+@app.get("/api/incidents/stats")
+async def api_get_incident_stats():
+    """Get aggregated incident statistics."""
+    return get_incident_stats()
+
+
+@app.get("/api/metrics/history")
+async def api_get_metrics_history(minutes: int = 60):
+    """Get historical metrics for charting."""
+    history = get_metrics_history(minutes=min(minutes, 1440))
+    return {"history": history, "total": len(history)}
+
+
+# ──────────────────────────────────────────────
+# Learning Loop Endpoints
+# ──────────────────────────────────────────────
+
+@app.get("/api/learning")
+async def api_get_learning(incident_type: str | None = None):
+    """Get learning data and insights."""
+    return get_learning_dashboard_data(incident_type)
+
+
+@app.post("/api/learning/feedback")
+async def api_learning_feedback(req: FeedbackRequest, request: Request):
+    """Submit feedback on an AI analysis (was it correct?)."""
+    role = getattr(request.state, "api_key_role", "viewer")
+    if role not in ("admin", "operator"):
+        raise HTTPException(403, "Only admin/operator can give feedback")
+    from app.storage import update_learning_feedback
+    update_learning_feedback(req.record_id, req.was_correct, req.feedback)
+    _add_event(f"Learning feedback: record #{req.record_id} marked {'correct' if req.was_correct else 'incorrect'}")
+    return {"status": "ok", "record_id": req.record_id}
 
 
 # ──────────────────────────────────────────────

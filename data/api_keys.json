@@ -1,0 +1,17 @@
+{
+  "keys": {
+    "321fdefc9aa6c82a86bd1bd8729b9a7c04800fc2f1cc7e82d00ae45446ff9c0d": {
+      "name": "default-admin",
+      "role": "admin",
+      "created_at": "2026-02-21T22:08:46.161015",
+      "revoked": false
+    },
+    "53019ad239aa74f50d073c37e58fae735e85d99e3db7134b7e16548437eca463": {
+      "name": "test-viewer",
+      "role": "viewer",
+      "created_at": "2026-02-21T22:11:58.770887",
+      "revoked": false
+    }
+  },
+  "default_admin_key": "cs-admin-e1748caece4ed38acc9bd24ffbd7f511"
+}
