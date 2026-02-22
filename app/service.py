@@ -7,6 +7,7 @@ Includes incident-injection endpoints for live simulation.
 import asyncio
 import time
 import random
+import os
 import psutil
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -131,11 +132,20 @@ app = FastAPI(
 
 
 # ──────────────────────────────────────────────
-# CORS — allow React frontend
+# CORS — allow React frontend (local + deployed)
 # ──────────────────────────────────────────────
+_cors_origins = [
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+]
+# Add any Vercel / custom frontend URL from env
+_frontend_url = os.environ.get("FRONTEND_URL", "")
+if _frontend_url:
+    _cors_origins.append(_frontend_url.rstrip("/"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+    allow_origins=_cors_origins if _frontend_url else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
