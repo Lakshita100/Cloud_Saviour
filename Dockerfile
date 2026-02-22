@@ -12,11 +12,8 @@ COPY agent/ ./agent/
 COPY data/ ./data/
 COPY dashboard/ ./dashboard/
 COPY monitoring/ ./monitoring/
-COPY start.sh .
-
 # Railway injects PORT at runtime; default for local Docker
 ENV PORT=8000
 EXPOSE ${PORT}
 
-RUN chmod +x start.sh
-CMD ["./start.sh"]
+CMD sh -c "uvicorn app.service:app --host 0.0.0.0 --port ${PORT}"

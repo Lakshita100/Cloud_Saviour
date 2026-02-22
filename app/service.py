@@ -132,20 +132,11 @@ app = FastAPI(
 
 
 # ──────────────────────────────────────────────
-# CORS — allow React frontend (local + deployed)
+# CORS — allow any origin (frontend may be on Vercel, localhost, etc.)
 # ──────────────────────────────────────────────
-_cors_origins = [
-    "http://localhost:8080",
-    "http://127.0.0.1:8080",
-]
-# Add any Vercel / custom frontend URL from env
-_frontend_url = os.environ.get("FRONTEND_URL", "")
-if _frontend_url:
-    _cors_origins.append(_frontend_url.rstrip("/"))
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins if _frontend_url else ["*"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
