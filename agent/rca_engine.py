@@ -11,6 +11,10 @@ def _call_ollama(model: str, prompt: str) -> dict:
     """Send a chat request to Ollama and return the parsed JSON response."""
     response = requests.post(
         OLLAMA_URL,
+        headers={
+            "Content-Type": "application/json",
+            "ngrok-skip-browser-warning": "true",   # bypass ngrok free-tier interstitial
+        },
         json={
             "model": model,
             "messages": [
