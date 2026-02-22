@@ -1,7 +1,9 @@
 import requests
 import json
+import os
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_URL = f"{OLLAMA_HOST}/api/chat"
 MODELS = ["phi3", "tinyllama"]  # try in order; fallback to smaller if OOM
 
 
